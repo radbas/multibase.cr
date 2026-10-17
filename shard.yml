@@ -1,7 +1,7 @@
 name: multibase
-version: 0.2.0
+version: 1.0.0
 description: |
-  Base58, Base62, Base85 (RFC 1924) and custom alphabet transcoder with multibyte character support.
+  Fast, strict Base58 (Bitcoin), Base62, Base85 (RFC 1924) and custom alphabet (BaseN) encoding, with Unicode alphabet support.
 
 authors:
   - Johannes Rabausch <mail@jrabausch.de>
