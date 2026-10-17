@@ -1,10 +1,14 @@
 name: multibase
-version: 0.1.0
+version: 0.2.0
+description: |
+  Base58, Base62, Base85 (RFC 1924) and custom alphabet transcoder with multibyte character support.
 
 authors:
   - Johannes Rabausch <mail@jrabausch.de>
 
-crystal: 1.8.2
+repository: https://github.com/radbas/multibase.cr
+
+crystal: ">= 1.8.2, < 2.0.0"
 
 development_dependencies:
   ameba:

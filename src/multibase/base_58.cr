@@ -1,21 +1,26 @@
-require "./base"
+require "./transcoder"
 
+# Base58 using the Bitcoin alphabet.
+#
+# ```
+# Multibase::Base58.encode("Hello World") # => "JxF12TrwUP45BMd"
+# ```
 module Multibase::Base58
-  extend Base
   extend self
 
-  @@dict = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
-  @@map = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuv"
+  ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
 
-  private def the_base
-    58
+  private TRANSCODER = Transcoder.new(ALPHABET)
+
+  # Encodes *data* to Base58.
+  def encode(data : String | Bytes | Int) : String
+    TRANSCODER.encode(data)
   end
 
-  private def the_dict
-    @@dict
-  end
-
-  private def the_map
-    @@map
+  # Decodes the Base58 string *str*.
+  #
+  # Raises `ArgumentError` on invalid characters.
+  def decode(str : String) : Bytes
+    TRANSCODER.decode(str)
   end
 end
