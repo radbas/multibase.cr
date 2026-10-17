@@ -1,18 +1,19 @@
 require "big"
-
-module Multibase
-  # :nodoc:
-  lib LibGMPExt
-    fun gmpz_import = __gmpz_import(rop : LibGMP::MPZ*, count : LibC::SizeT, order : LibC::Int, size : LibC::SizeT, endian : LibC::Int, nails : LibC::SizeT, op : Void*)
-    fun gmpz_export = __gmpz_export(rop : Void*, countp : LibC::SizeT*, order : LibC::Int, size : LibC::SizeT, endian : LibC::Int, nails : LibC::SizeT, op : LibGMP::MPZ*) : Void*
-  end
-end
+require "./error"
+require "./gmp"
 
 # Transcodes bytes from and to an arbitrary alphabet.
 #
+# The input is read as one big-endian number and written in the base given by
+# the alphabet size, the same way Bitcoin's Base58 works. Leading zero bytes
+# are kept as leading "zero" characters (the first character of the alphabet),
+# so every byte sequence has exactly one encoding and `#decode` is the exact
+# inverse of `#encode`.
+#
 # The alphabet is split into Unicode codepoints (`Char`), so multibyte
-# characters like emojis are supported. Leading zero bytes are preserved
-# as leading "zero" characters (the first character of the alphabet).
+# characters like emojis are supported.
+#
+# A transcoder is immutable and can be shared between fibers and threads.
 #
 # ```
 # transcoder = Multibase::Transcoder.new("0123456789")
@@ -20,10 +21,13 @@ end
 # transcoder.decode("0256")         # => Bytes[0, 1, 0]
 # ```
 class Multibase::Transcoder
-  # Digits used by GMP for bases up to 36.
-  GMP_LOWER = "0123456789abcdefghijklmnopqrstuvwxyz"
-  # Digits used by GMP for bases 37 to 62.
-  GMP_UPPER = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+  # Largest base GMP converts natively. Larger bases use divide and conquer.
+  private GMP_MAX_BASE = 62
+  # GMP's digit characters for bases up to 36 and up to 62.
+  private GMP_LOWER = "0123456789abcdefghijklmnopqrstuvwxyz"
+  private GMP_UPPER = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+  # Machine words converted one by one before switching to divide and conquer.
+  private LEAF_WORDS = 128
 
   # The alphabet used for transcoding.
   getter alphabet : String
@@ -31,160 +35,356 @@ class Multibase::Transcoder
   getter base : Int32
 
   @chars : Array(Char)
-  # alphabet bytes if the alphabet is ASCII only
+  # alphabet bytes, `nil` unless the alphabet is ASCII only
   @ascii : Bytes?
-  # char to digit lookup, `-1` marks invalid chars
-  @ascii_lookup : Array(Int32)?
-  @lookup : Hash(Char, Int32) = {} of Char => Int32
-  # GMP digit bytes and their reverse lookup (base <= 62 only)
-  @gmp_digits : Bytes = Bytes.empty
-  @gmp_values : Array(Int32) = [] of Int32
-  # alphabet matches GMP's digits, no mapping required
-  @identity : Bool = false
-  # digits per GMP word and base ** chunk_size (base > 62 only)
-  @chunk_size : Int32 = 1
-  @chunk_base : UInt64 = 0
+  # digit value of each ASCII character, `-1` if not part of the alphabet
+  @ascii_digits : Array(Int32)
+  # digit value of each non-ASCII character
+  @digits : Hash(Char, Int32)
+  @max_char_bytesize : Int32
 
+  # base <= 62: GMP's digit characters, their values, and whether they are
+  # identical to the alphabet (no mapping needed)
+  @gmp_digits = Bytes.empty
+  @gmp_values = Bytes.empty
+  @gmp_identity = false
+
+  # base > 62: digits per machine word, `base ** word_digits`, and
+  # `base ** leaf_digits`, the largest value converted word by word
+  @word_digits = 1
+  @word_base = 0_u64
+  @leaf_power = BigInt.new(1)
+
+  # Creates a transcoder where each character of *alphabet* stands for its
+  # position: the first character is `0`, the second `1` and so on.
+  #
+  # Raises `Multibase::Error` if *alphabet* has fewer than 2 characters,
+  # contains a character twice, or is not valid UTF-8.
   def initialize(@alphabet : String)
+    raise Error.new("Alphabet must be valid UTF-8") unless alphabet.valid_encoding?
     @chars = alphabet.chars
     @base = @chars.size
-    raise ArgumentError.new("Alphabet must contain at least 2 characters") if @base < 2
+    raise Error.new("Alphabet must contain at least 2 characters") if @base < 2
 
-    if alphabet.ascii_only?
-      @ascii = alphabet.to_slice
-      table = Array(Int32).new(128, -1)
-      @chars.each_with_index do |char, i|
-        raise ArgumentError.new("Alphabet contains duplicate character #{char.inspect}") if table[char.ord] >= 0
-        table[char.ord] = i
+    @ascii = alphabet.to_slice if alphabet.ascii_only?
+    @max_char_bytesize = @chars.max_of(&.bytesize)
+    @ascii_digits = Array(Int32).new(128, -1)
+    @digits = {} of Char => Int32
+    @chars.each_with_index do |char, digit|
+      raise Error.new("Alphabet contains duplicate character #{char.inspect}") if digit_of(char) >= 0
+      if char.ascii?
+        @ascii_digits[char.ord] = digit
+      else
+        @digits[char] = digit
       end
-      @ascii_lookup = table
-    else
-      hash = Hash(Char, Int32).new(initial_capacity: @base)
-      @chars.each_with_index do |char, i|
-        raise ArgumentError.new("Alphabet contains duplicate character #{char.inspect}") if hash.has_key?(char)
-        hash[char] = i
-      end
-      @lookup = hash
     end
 
-    if @base <= 62
+    if @base <= GMP_MAX_BASE
       @gmp_digits = (@base <= 36 ? GMP_LOWER : GMP_UPPER).to_slice[0, @base]
-      @gmp_values = Array(Int32).new(128, -1)
-      @gmp_digits.each_with_index { |b, i| @gmp_values[b] = i }
-      @identity = @gmp_digits == alphabet.to_slice
+      @gmp_values = Bytes.new(128)
+      @gmp_digits.each_with_index { |byte, digit| @gmp_values[byte] = digit.to_u8 }
+      @gmp_identity = @gmp_digits == alphabet.to_slice
     else
-      max = LibGMP::UI::MAX.to_u64
-      @chunk_base = @base.to_u64
-      while @chunk_base <= max // @base
-        @chunk_base *= @base
-        @chunk_size += 1
+      @word_base = @base.to_u64
+      while @word_base <= LibGMP::UI::MAX // @base
+        @word_base *= @base
+        @word_digits += 1
       end
+      @leaf_power = BigInt.new(@base) ** leaf_digits
     end
   end
 
   # Encodes *data* using the alphabet.
+  #
+  # ```
+  # Multibase::Transcoder.new("0123456789").encode(Bytes[1, 0]) # => "256"
+  # ```
   def encode(data : String | Bytes) : String
     data = data.to_slice
-    zeros = 0
-    while zeros < data.size && data[zeros] == 0
-      zeros += 1
-    end
+    zeros = data.index { |byte| byte != 0 } || data.size
     rest = data + zeros
     return render(zeros, Bytes.empty) if rest.empty?
 
-    LibGMP.init(out mpz)
-    LibGMPExt.gmpz_import(pointerof(mpz), rest.size, 1, 1, 1, 0, rest.to_unsafe.as(Void*))
-    encode_mpz(pointerof(mpz), zeros)
+    encode_value(GMP.import(rest), zeros)
   end
 
   # Encodes the non-negative integer *int* using the alphabet.
   #
-  # Zero is encoded as the first character of the alphabet.
+  # Zero is encoded as the first character of the alphabet. Raises
+  # `Multibase::Error` if *int* is negative.
+  #
+  # ```
+  # Multibase::Transcoder.new("0123456789").encode(256) # => "256"
+  # ```
   def encode(int : Int) : String
-    raise ArgumentError.new("Cannot encode negative integer #{int}") if int < 0
+    raise Error.new("Cannot encode negative integer #{int}") if int < 0
     return @chars[0].to_s if int == 0
 
-    # copy (mpz = int + 0), the conversion modifies the value in place
-    LibGMP.init(out mpz)
-    LibGMP.add_ui(pointerof(mpz), int.to_big_i, 0)
-    encode_mpz(pointerof(mpz), 0)
+    encode_value(int.to_big_i, 0)
   end
 
   # Decodes *str* into bytes.
   #
-  # Raises `ArgumentError` if *str* contains a character that is not part of the alphabet.
+  # Raises `Multibase::Error` if *str* contains a character that is not part
+  # of the alphabet or is not valid UTF-8. Nothing is skipped, not even
+  # whitespace.
+  #
+  # ```
+  # Multibase::Transcoder.new("0123456789").decode("256") # => Bytes[1, 0]
+  # ```
   def decode(str : String) : Bytes
-    return Bytes.empty if str.empty?
+    decode?(str) || raise invalid_input(str)
+  end
 
-    digits = Array(Int32).new(str.size)
-    zeros = 0
-    str.each_char_with_index do |char, i|
-      digit = digit_of(char)
-      raise ArgumentError.new("Invalid character #{char.inspect} at position #{i}") if digit < 0
-      zeros += 1 if digit == 0 && zeros == digits.size
-      digits << digit
+  # Like `#decode`, but returns `nil` if *str* is invalid.
+  def decode?(str : String) : Bytes?
+    if parsed = parse(str)
+      zeros, value = parsed
+      GMP.export(value, zeros + GMP.byte_size(value))
     end
-    return Bytes.new(zeros) if zeros == digits.size
+  end
 
-    LibGMP.init(out mpz)
-    if @base <= 62
-      # NUL terminated string of GMP digits
-      buf = Bytes.new(digits.size - zeros + 1)
-      (zeros...digits.size).each { |i| buf[i - zeros] = @gmp_digits[digits[i]] }
-      LibGMP.set_str(pointerof(mpz), buf, @base)
+  # Decodes *str* into a non-negative integer, the inverse of `#encode(Int)`.
+  #
+  # Leading zero characters are ignored, so zero-padded strings decode to the
+  # same number. Raises `Multibase::Error` if *str* is empty or invalid.
+  #
+  # ```
+  # Multibase::Transcoder.new("0123456789").decode_int("00256") # => 256
+  # ```
+  def decode_int(str : String) : BigInt
+    raise Error.new("Cannot decode empty string to integer") if str.empty?
+    decode_int?(str) || raise invalid_input(str)
+  end
+
+  # Like `#decode_int`, but returns `nil` if *str* is empty or invalid.
+  def decode_int?(str : String) : BigInt?
+    return if str.empty?
+    parse(str).try &.[1]
+  end
+
+  # Splits *str* into the number of leading zero characters and the value of
+  # the remaining digits. Returns `nil` if *str* is invalid.
+  private def parse(str : String) : {Int32, BigInt}?
+    if @base <= GMP_MAX_BASE
+      # GMP digits, NUL terminated for `set_str`
+      digits = Bytes.new(str.bytesize + 1)
+      size = 0
+      valid = each_digit(str) do |digit|
+        digits[size] = @gmp_digits[digit]
+        size += 1
+      end
+      return unless valid
+
+      zeros = digits.index! { |byte| byte != '0'.ord }
+      return {zeros, BigInt.new} if zeros == size
+      {zeros, BigInt.new { |mpz| LibGMP.set_str(mpz, digits + zeros, @base) }}
     else
-      i = zeros
-      while i < digits.size
-        len = Math.min(@chunk_size, digits.size - i)
-        chunk = 0_u64
-        mult = 1_u64
-        len.times do
-          chunk = chunk * @base + digits[i]
-          mult *= @base
+      digits = Array(Int32).new(str.size)
+      return unless each_digit(str) { |digit| digits << digit }
+
+      zeros = digits.index { |digit| digit != 0 } || digits.size
+      {zeros, digits_to_big(digits, zeros)}
+    end
+  end
+
+  # Yields the digit value of each character of *str*. Returns `false` if a
+  # character is not part of the alphabet or *str* is not valid UTF-8.
+  private def each_digit(str : String, & : Int32 ->) : Bool
+    if @ascii
+      # any byte >= 0x80, including malformed UTF-8, is invalid
+      str.to_slice.each do |byte|
+        digit = byte < 0x80 ? @ascii_digits[byte] : -1
+        return false if digit < 0
+        yield digit
+      end
+    else
+      return false unless str.valid_encoding?
+      str.each_char do |char|
+        digit = digit_of(char)
+        return false if digit < 0
+        yield digit
+      end
+    end
+    true
+  end
+
+  # Describes the first problem in *str*, which `#parse` rejected.
+  private def invalid_input(str : String) : Error
+    reader = Char::Reader.new(str)
+    index = 0
+    while reader.has_next?
+      if byte = reader.error
+        return Error.new("Invalid UTF-8 byte 0x#{"%02x" % byte} at byte offset #{reader.pos}")
+      end
+      char = reader.current_char
+      return Error.new("Invalid character #{char.inspect} at position #{index}") if digit_of(char) < 0
+      reader.next_char
+      index += 1
+    end
+    Error.new("Invalid input")
+  end
+
+  private def digit_of(char : Char) : Int32
+    char.ascii? ? @ascii_digits[char.ord] : @digits.fetch(char, -1)
+  end
+
+  # Encodes the positive *value*, prefixed by *zeros* zero characters.
+  private def encode_value(value : BigInt, zeros : Int32) : String
+    check_output_size(value, zeros)
+    if @base <= GMP_MAX_BASE
+      render(zeros, gmp_digits(value), raw: @gmp_identity)
+    else
+      render(zeros, big_to_digits(value))
+    end
+  end
+
+  # Raises if the encoding of *value* would exceed the maximum `String` size.
+  private def check_output_size(value : BigInt, zeros : Int32) : Nil
+    digits = LibGMP.sizeinbase(value, 2) / Math.log2(@base) + 1
+    if (zeros + digits) * @max_char_bytesize > Int32::MAX
+      raise Error.new("Encoded output would exceed the maximum string size")
+    end
+  end
+
+  # Converts *value* with GMP (base <= 62). Returns GMP's digit characters if
+  # they are identical to the alphabet, digit values otherwise.
+  private def gmp_digits(value : BigInt) : Bytes
+    # `sizeinbase` may be 1 too large, plus NUL terminator
+    buf = Bytes.new(LibGMP.sizeinbase(value, @base).to_i + 2)
+    LibGMP.get_str(buf, @base, value)
+    buf = buf[0, buf.index!(0_u8)]
+    buf.map! { |byte| @gmp_values[byte] } unless @gmp_identity
+    buf
+  end
+
+  # Number of digits in `@leaf_power`.
+  private def leaf_digits : Int32
+    @word_digits * LEAF_WORDS
+  end
+
+  # Converts *digits* (most significant first) from index *start* to a number.
+  #
+  # Splits the digits into leaves of `leaf_digits`, converts each one word by
+  # word, then merges neighbours pairwise (`high * base ** n + low`), doubling
+  # `n` every round. With GMP's fast multiplication this runs in quasi-linear
+  # time, unlike the quadratic digit-by-digit loop.
+  private def digits_to_big(digits : Array(Int32), start : Int32) : BigInt
+    count = digits.size - start
+    return BigInt.new if count == 0
+
+    # right aligned, so only the first leaf can be shorter
+    first = (count - 1) % leaf_digits + 1
+    level = [leaf_to_big(digits, start, first)]
+    (start + first).step(to: digits.size - 1, by: leaf_digits) do |i|
+      level << leaf_to_big(digits, i, leaf_digits)
+    end
+
+    power = @leaf_power
+    while level.size > 1
+      # pair from the right, so every low half has as many digits as `power`
+      merged = Array(BigInt).new((level.size + 1) // 2)
+      merged << level.first if level.size.odd?
+      (level.size % 2).step(to: level.size - 2, by: 2) do |i|
+        merged << level[i] * power + level[i + 1]
+      end
+      level = merged
+      power *= power if level.size > 1
+    end
+    level.first
+  end
+
+  # Converts *size* digits starting at *from* to a number, one word at a time.
+  private def leaf_to_big(digits : Array(Int32), from : Int32, size : Int32) : BigInt
+    BigInt.new do |mpz|
+      i = from
+      stop = from + size
+      while i < stop
+        word = 0_u64
+        scale = 1_u64
+        Math.min(@word_digits, stop - i).times do
+          word = word * @base + digits[i]
+          scale *= @base
           i += 1
         end
-        LibGMP.mul_ui(pointerof(mpz), pointerof(mpz), LibGMP::UI.new(mult))
-        LibGMP.add_ui(pointerof(mpz), pointerof(mpz), LibGMP::UI.new(chunk))
+        LibGMP.mul_ui(mpz, mpz, LibGMP::UI.new(scale))
+        LibGMP.add_ui(mpz, mpz, LibGMP::UI.new(word))
       end
     end
-
-    size = (LibGMP.sizeinbase(pointerof(mpz), 2).to_i + 7) // 8
-    bytes = Bytes.new(zeros + size)
-    LibGMPExt.gmpz_export((bytes + zeros).to_unsafe.as(Void*), out _, 1, 1, 1, 0, pointerof(mpz))
-    bytes
   end
 
-  # Converts a positive *mpz* into the alphabet, prefixed by *zeros* zero chars.
-  # The value of *mpz* is modified.
-  private def encode_mpz(mpz : LibGMP::MPZ*, zeros : Int32) : String
-    if @base <= 62
-      # `sizeinbase` may be 1 greater than the exact value, plus NUL terminator
-      buf = Bytes.new(LibGMP.sizeinbase(mpz, @base).to_i + 2)
-      LibGMP.get_str(buf, @base, mpz)
-      buf = buf[0, buf.index!(0_u8)]
-      buf.map! { |b| @gmp_values[b].to_u8 } unless @identity
-      return render(zeros, buf, @identity)
+  # Converts the positive *value* to digits, most significant first.
+  #
+  # The inverse of `#digits_to_big`: splits *value* recursively by
+  # `base ** (leaf_digits * 2 ** k)` until the parts fit into a leaf.
+  private def big_to_digits(value : BigInt) : Array(Int32)
+    # powers[k] = @leaf_power ** (2 ** k), up to the largest not above value
+    powers = [] of BigInt
+    power = @leaf_power
+    while power <= value
+      powers << power
+      # skip the last squaring if the result would surely exceed value
+      break if 2 * (power.bit_length - 1) >= value.bit_length
+      power *= power
     end
 
-    # log2(base) > 5 for base > 62
-    digits = Array(Int32).new(LibGMP.sizeinbase(mpz, 2).to_i // 5 + @chunk_size)
-    LibGMP.init(out rem)
-    while LibGMP.cmp_ui(mpz, 0) != 0
-      chunk = LibGMP.tdiv_qr_ui(mpz, pointerof(rem), mpz, LibGMP::UI.new(@chunk_base)).to_u64
-      @chunk_size.times do
-        digits << (chunk % @base).to_i
-        chunk //= @base
-      end
-    end
-    while digits.last? == 0
-      digits.pop
-    end
-    render(zeros, digits.reverse!)
+    digits = Array(Int32).new((value.bit_length / Math.log2(@base)).to_i + 1)
+    append_digits(digits, value, powers, powers.size - 1, pad: false)
+    digits
   end
 
-  # Builds the output string from *zeros* zero chars followed by *digits*.
-  # If *raw* is set, *digits* already contains the output bytes.
-  private def render(zeros : Int32, digits : Indexable(Int), raw : Bool = false) : String
+  # Appends the digits of *value*, which is less than `powers[level] ** 2`
+  # (`@leaf_power` if *level* is `-1`). With *pad*, appends exactly
+  # `leaf_digits * 2 ** (level + 1)` digits, left padded with zeros.
+  private def append_digits(digits : Array(Int32), value : BigInt, powers : Array(BigInt), level : Int32, pad : Bool) : Nil
+    return append_leaf(digits, value, pad) if level < 0
+
+    high, low = value.divmod(powers[level])
+    if pad || high > 0
+      append_digits(digits, high, powers, level - 1, pad)
+      append_digits(digits, low, powers, level - 1, pad: true)
+    else
+      append_digits(digits, low, powers, level - 1, pad: false)
+    end
+  end
+
+  # Appends the digits of *value*, which is less than `@leaf_power`, one word
+  # at a time. With *pad*, appends exactly `leaf_digits` digits.
+  private def append_leaf(digits : Array(Int32), value : BigInt, pad : Bool) : Nil
+    # split into words, least significant first, dividing a copy in place
+    words = StaticArray(UInt64, LEAF_WORDS).new(0_u64)
+    count = 0
+    LibGMP.init(out rest)
+    LibGMP.init(out remainder)               # unused, but required by `tdiv_qr_ui`
+    LibGMP.add_ui(pointerof(rest), value, 0) # rest = value
+    while count < LEAF_WORDS && (pad || LibGMP.cmp_ui(pointerof(rest), 0) != 0)
+      words[count] = LibGMP.tdiv_qr_ui(pointerof(rest), pointerof(remainder), pointerof(rest), LibGMP::UI.new(@word_base)).to_u64
+      count += 1
+    end
+
+    # only the most significant word may go without leading zeros
+    (count - 1).downto(0) do |i|
+      append_word(digits, words[i], pad: pad || i < count - 1)
+    end
+  end
+
+  # Appends the digits of *word*. With *pad*, appends exactly `@word_digits`
+  # digits, otherwise none for zero.
+  private def append_word(digits : Array(Int32), word : UInt64, pad : Bool) : Nil
+    # least significant first; base > 62 means at most 10 digits per word
+    buffer = StaticArray(Int32, 16).new(0)
+    size = 0
+    while word > 0 || (pad && size < @word_digits)
+      buffer[size] = (word % @base).to_i
+      word //= @base
+      size += 1
+    end
+    (size - 1).downto(0) { |i| digits << buffer[i] }
+  end
+
+  # Builds the output from *zeros* zero characters followed by *digits*. With
+  # *raw*, *digits* already holds the output bytes.
+  private def render(zeros : Int32, digits : Bytes | Array(Int32), raw : Bool = false) : String
     size = zeros + digits.size
     if ascii = @ascii
       String.new(size) do |buf|
@@ -197,18 +397,10 @@ class Multibase::Transcoder
         {size, size}
       end
     else
-      String.build(size * @chars[0].bytesize) do |io|
+      String.build(size * @max_char_bytesize) do |io|
         zeros.times { io << @chars[0] }
         digits.each { |digit| io << @chars[digit] }
       end
-    end
-  end
-
-  private def digit_of(char : Char) : Int32
-    if table = @ascii_lookup
-      char.ascii? ? table[char.ord] : -1
-    else
-      @lookup.fetch(char, -1)
     end
   end
 end
