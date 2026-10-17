@@ -8,20 +8,44 @@ on:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
+    continue-on-error: ${{ matrix.crystal == 'nightly' }}
     strategy:
       fail-fast: false
       matrix:
+        os: [ubuntu-latest, macos-latest]
         crystal: [1.8.2, latest]
+        include:
+          - os: ubuntu-latest
+            crystal: nightly
     steps:
       - uses: actions/checkout@v4
-      - name: Install GMP
+      - name: Install GMP (Linux)
+        if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libgmp-dev
+      - name: Install GMP (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install gmp
+          echo "LIBRARY_PATH=$(brew --prefix)/lib" >> "$GITHUB_ENV"
       - uses: crystal-lang/install-crystal@v1
         with:
           crystal: ${{ matrix.crystal }}
       - name: Run specs
         run: crystal spec
+
+  fuzz:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install GMP
+        run: sudo apt-get update && sudo apt-get install -y libgmp-dev
+      - uses: crystal-lang/install-crystal@v1
+      - name: Run extended fuzzing
+        # a new seed every run; a failure prints it for reproduction
+        run: |
+          crystal build --release spec/fuzz_spec.cr -o fuzz
+          FUZZ_SEED=${{ github.run_id }} FUZZ_ITERATIONS=20 ./fuzz
 
   lint:
     runs-on: ubuntu-latest
@@ -30,6 +54,8 @@ jobs:
       - uses: crystal-lang/install-crystal@v1
       - name: Check formatting
         run: crystal tool format --check
+      - name: Build docs
+        run: crystal docs
       - name: Install dependencies
         run: shards install
       - name: Run ameba
